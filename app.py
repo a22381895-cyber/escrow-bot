@@ -5,6 +5,9 @@ Uses polling (no webhook needed), compatible with Render free tier.
 
 import logging
 import sys
+import threading
+import os
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from telegram import Update
 from telegram.ext import (
@@ -39,8 +42,22 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
-# ── Error handler ─────────────────────────────────────────────────────────────
+# ── Dummy Web Server for Render ───────────────────────────────────────────────
+class DummyHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b"Bot is running successfully!")
 
+def run_dummy_server():
+    # Render tana bayar da PORT a matsayin environment variable
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(('0.0.0.0', port), DummyHandler)
+    server.serve_forever()
+
+
+# ── Error handler ─────────────────────────────────────────────────────────────
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error("Unhandled exception: %s", context.error, exc_info=context.error)
 
@@ -54,7 +71,6 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
-
 def main() -> None:
     # Initialise DB
     db.init_db()
@@ -80,6 +96,10 @@ def main() -> None:
     # ── Error handler ──────────────────────────────────────────────────────────
     app.add_error_handler(error_handler)
 
+    # ── Start the dummy server in a background thread ──────────────────────────
+    logger.info("Starting dummy web server for Render...")
+    threading.Thread(target=run_dummy_server, daemon=True).start()
+
     logger.info("Bot starting — polling…")
     app.run_polling(
         allowed_updates=Update.ALL_TYPES,
@@ -89,3 +109,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+        
