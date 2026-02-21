@@ -1,474 +1,235 @@
-"""
-Core escrow command handlers.
-"""
-
 import logging
-from telegram import Update
-from telegram.ext import ContextTypes
-from telegram.constants import ParseMode
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ContextTypes, ConversationHandler
 
 import database as db
-from config import BSC_ADDRESS, ADMIN_ID, COMMISSION_PERCENT
-from utils import (
-    generate_trade_id,
-    calculate_amounts,
-    verify_transaction,
-    trade_summary,
-    fmt_usdt,
-)
+from config import ADMIN_ID, ESCROW_WALLET, FEE_PERCENTAGE, SUPPORT_CONTACT
 
 logger = logging.getLogger(__name__)
 
+# State for ConversationHandler
+WAITING_FOR_TX = 1
 
-# ──────────────────────────────────────────────────────────────────────────────
-# /start
-# ──────────────────────────────────────────────────────────────────────────────
+# ─── MIDDLEWARE (Anti-ban check) ──────────────────────────────────────────────
+async def check_ban(update: Update) -> bool:
+    user_id = update.effective_user.id
+    if db.is_banned(user_id):
+        await update.effective_message.reply_text("⛔ You are banned from using this service.")
+        return True
+    return False
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
+# ─── USER COMMANDS ────────────────────────────────────────────────────────────
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await check_ban(update): return
+    
+    # Kwalliyar Trust & Branding kamar yadda ka bukata
     text = (
-        f"👋 Welcome, {user.first_name}!\n\n"
-        "🔐 <b>USDT BEP-20 Escrow Bot</b>\n\n"
-        "I hold funds safely between buyer and seller.\n\n"
-        "<b>Commands:</b>\n"
-        "  /create &lt;amount&gt; &lt;seller_username&gt;\n"
-        "    — Open a new escrow trade\n\n"
-        "  /paid &lt;trade_id&gt; &lt;tx_hash&gt;\n"
-        "    — Submit payment proof\n\n"
-        "  /status &lt;trade_id&gt;\n"
-        "    — Check trade status\n\n"
-        "  /confirm &lt;trade_id&gt;\n"
-        "    — Seller confirms delivery\n\n"
-        "  /dispute &lt;trade_id&gt; &lt;reason&gt;\n"
-        "    — Raise a dispute\n\n"
-        "  /cancel &lt;trade_id&gt;\n"
-        "    — Cancel an awaiting trade\n\n"
-        f"💸 Commission: <b>{COMMISSION_PERCENT}%</b> added to buyer's payment\n"
-        f"🏦 Escrow wallet: <code>{BSC_ADDRESS}</code>"
+        "🔐 *Gross Escrow — Secure Trade Protection*\n\n"
+        "We safely hold funds between buyer and seller to prevent scams.\n\n"
+        "✅ *Funds locked* before delivery\n"
+        "✅ *Seller paid* only after confirmation\n"
+        "✅ *Admin dispute* protection\n\n"
+        "⚙️ *How to start:*\n"
+        "Send: `/create <amount> <@seller_username>`\n"
+        "Example: `/create 100 @johndoe`\n\n"
+        f"🎧 Support: {SUPPORT_CONTACT}\n\n"
+        "⚠️ _Notice: Admin will NEVER DM you first. Never pay outside this bot._"
     )
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+    
+    keyboard = [
+        [InlineKeyboardButton("📊 View Statistics", callback_data="view_stats")],
+        [InlineKeyboardButton("🎧 Contact Support", url=f"https://t.me/{SUPPORT_CONTACT.replace('@', '')}")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=reply_markup)
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# /create <amount> <seller_username>
-# ──────────────────────────────────────────────────────────────────────────────
-
-async def cmd_create(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
+async def cmd_create(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await check_ban(update): return
+    
     args = context.args
-
-    if len(args) < 2:
-        await update.message.reply_text(
-            "❌ Usage: /create <amount> <seller_username>\n"
-            "Example: /create 100 john_doe"
-        )
+    if len(args) != 2:
+        await update.message.reply_text("❌ *Format error*\nUse: `/create <amount> <@seller_username>`", parse_mode="Markdown")
         return
-
-    # Validate amount
+        
     try:
         amount = float(args[0])
-        if amount <= 0:
-            raise ValueError
+        if amount <= 0: raise ValueError
     except ValueError:
-        await update.message.reply_text("❌ Amount must be a positive number.")
+        await update.message.reply_text("❌ Invalid amount.")
+        return
+        
+    seller_username = args[1].replace("@", "")
+    buyer = update.effective_user
+    buyer_username = buyer.username or str(buyer.id)
+    
+    if seller_username.lower() == buyer_username.lower():
+        await update.message.reply_text("❌ You cannot trade with yourself.")
         return
 
-    seller_username = args[1].lstrip("@").strip()
-    if not seller_username:
-        await update.message.reply_text("❌ Please provide a valid seller username.")
-        return
-
-    if seller_username.lower() == (user.username or "").lower():
-        await update.message.reply_text("❌ You cannot be both buyer and seller.")
-        return
-
-    amount_usdt, commission, total_required = calculate_amounts(amount)
-    trade_id = generate_trade_id()
-
-    db.create_trade(
-        trade_id=trade_id,
-        buyer_id=user.id,
-        buyer_username=user.username,
-        seller_username=seller_username,
-        amount_usdt=amount_usdt,
-        commission=commission,
-        total_required=total_required,
-    )
-
+    fee = amount * FEE_PERCENTAGE
+    total_to_pay = amount + fee
+    
+    trade_id = db.create_trade(buyer.id, buyer_username, seller_username, amount, fee)
+    
+    # Professional Trade Formatting & Wallet reveal
     text = (
-        f"✅ <b>Escrow Trade Created!</b>\n\n"
-        f"🆔 Trade ID   : <code>{trade_id}</code>\n"
-        f"📦 Amount     : {fmt_usdt(amount_usdt)}\n"
-        f"💸 Commission : {fmt_usdt(commission)} ({COMMISSION_PERCENT}%)\n"
-        f"💰 <b>You must send: {fmt_usdt(total_required)}</b>\n\n"
-        f"👤 Seller     : @{seller_username}\n\n"
-        f"<b>Step 1:</b> Send exactly <b>{fmt_usdt(total_required)}</b> USDT (BEP-20) to:\n"
-        f"<code>{BSC_ADDRESS}</code>\n\n"
-        f"<b>Step 2:</b> After sending, run:\n"
-        f"<code>/paid {trade_id} YOUR_TX_HASH</code>\n\n"
-        "⚠️ Send only USDT BEP-20 (BSC network). Other tokens will be lost."
+        f"🔒 *TRADE OPENED: #{trade_id}*\n\n"
+        f"👤 *Buyer:* @{buyer_username}\n"
+        f"🏪 *Seller:* @{seller_username}\n"
+        f"💰 *Amount:* {amount} USDT\n"
+        f"💸 *Fee ({int(FEE_PERCENTAGE*100)}%):* {fee} USDT\n"
+        f"💳 *Total to Send:* {total_to_pay} USDT\n\n"
+        f"📊 *Status:* 🟡 Waiting for payment\n\n"
+        f"💳 *Payment Address (USDT BEP-20):*\n`{ESCROW_WALLET}`\n\n"
+        "⚠️ _ONLY send USDT BEP-20 to this exact address. Once sent, click the button below._"
     )
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+    
+    keyboard = [
+        [InlineKeyboardButton("✅ I Sent Payment", callback_data=f"pay_{trade_id}")],
+        [InlineKeyboardButton("❌ Cancel Trade", callback_data=f"cancel_{trade_id}")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=reply_markup)
 
+# ─── INTERACTIVE BUTTON CALLBACKS ─────────────────────────────────────────────
 
-# ──────────────────────────────────────────────────────────────────────────────
-# /paid <trade_id> <tx_hash>
-# ──────────────────────────────────────────────────────────────────────────────
-
-async def cmd_paid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    args = context.args
-
-    if len(args) < 2:
-        await update.message.reply_text(
-            "❌ Usage: /paid <trade_id> <tx_hash>\n"
-            "Example: /paid ESC-A3F9B2 0xabc123..."
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    
+    if data == "view_stats":
+        comp, vol, act = db.get_stats()
+        text = (
+            "📊 *Gross Escrow Statistics*\n\n"
+            f"✅ *Completed Trades:* {comp}\n"
+            f"💰 *Volume Secured:* {vol:,.2f} USDT\n"
+            f"🔄 *Active Trades:* {act}\n\n"
+            "🛡️ _100% Safe & Secure_"
         )
-        return
+        await query.message.reply_text(text, parse_mode="Markdown")
+        return ConversationHandler.END
 
-    trade_id = args[0].upper().strip()
-    tx_hash = args[1].strip()
+    if data.startswith("cancel_"):
+        trade_id = int(data.split("_")[1])
+        trade = db.get_trade(trade_id)
+        if not trade or trade['buyer_id'] != update.effective_user.id:
+            await query.message.reply_text("❌ Not your trade.")
+            return ConversationHandler.END
+            
+        if trade['status'] != 'Waiting for payment':
+            await query.message.reply_text("❌ Cannot cancel this trade anymore.")
+            return ConversationHandler.END
+            
+        db.update_trade_status(trade_id, "Cancelled")
+        await query.edit_message_text(f"🚫 *Trade #{trade_id} Cancelled by Buyer.*", parse_mode="Markdown")
+        return ConversationHandler.END
 
-    if not tx_hash.startswith("0x") or len(tx_hash) < 60:
-        await update.message.reply_text("❌ Invalid TX hash format. It should start with 0x and be 66 chars.")
-        return
-
-    # Load trade
-    trade = db.get_trade(trade_id)
-    if not trade:
-        await update.message.reply_text(f"❌ Trade <code>{trade_id}</code> not found.", parse_mode=ParseMode.HTML)
-        return
-
-    # Ownership check
-    if trade["buyer_id"] != user.id:
-        await update.message.reply_text("❌ Only the buyer of this trade can submit payment.")
-        return
-
-    # Status check
-    if trade["status"] != "AWAITING_PAYMENT":
-        await update.message.reply_text(
-            f"❌ This trade is already in status <b>{trade['status']}</b>.",
-            parse_mode=ParseMode.HTML,
+    if data.startswith("pay_"):
+        trade_id = int(data.split("_")[1])
+        trade = db.get_trade(trade_id)
+        if not trade or trade['buyer_id'] != update.effective_user.id:
+            await query.message.reply_text("❌ Not your trade.")
+            return ConversationHandler.END
+            
+        context.user_data['paying_trade_id'] = trade_id
+        await query.message.reply_text(
+            f"📥 *Please reply to this message with your Transaction Hash (TX Hash) for Trade #{trade_id}.*\n\n"
+            "Type /cancel_pay to abort.", 
+            parse_mode="Markdown"
         )
-        return
+        return WAITING_FOR_TX
+        
+    if data.startswith("confirm_"):
+        trade_id = int(data.split("_")[1])
+        trade = db.get_trade(trade_id)
+        # Only buyer can confirm delivery
+        if trade['buyer_id'] != update.effective_user.id:
+            await query.message.reply_text("❌ Only the buyer can confirm delivery.")
+            return ConversationHandler.END
+            
+        db.update_trade_status(trade_id, "Completed")
+        await query.edit_message_text(f"✅ *Trade #{trade_id} Completed.*\nFunds will be released to @{trade['seller_username']} shortly.", parse_mode="Markdown")
+        return ConversationHandler.END
+        
+    if data.startswith("dispute_"):
+        trade_id = int(data.split("_")[1])
+        db.update_trade_status(trade_id, "Disputed")
+        await query.edit_message_text(f"⚖️ *Dispute Opened for Trade #{trade_id}.*\nAdmin has been notified and will resolve this.", parse_mode="Markdown")
+        return ConversationHandler.END
 
-    # Duplicate TX check
-    if db.is_tx_used(tx_hash):
-        await update.message.reply_text(
-            "❌ This transaction hash has already been used in another trade."
-        )
-        return
+# ─── PAYMENT FLOW (Conversation) ─────────────────────────────────────────────
 
-    await update.message.reply_text("⏳ Verifying your transaction on BscScan… please wait.")
+async def receive_tx(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tx_hash = update.message.text
+    trade_id = context.user_data.get('paying_trade_id')
+    
+    if len(tx_hash) < 10:  # Basic validation
+        await update.message.reply_text("❌ Invalid TX Hash format. Please try again or /cancel_pay.")
+        return WAITING_FOR_TX
+        
+    db.update_trade_status(trade_id, "Payment Under Review", tx_hash)
+    
+    keyboard = [
+        [InlineKeyboardButton("📦 Confirm Delivery", callback_data=f"confirm_{trade_id}")],
+        [InlineKeyboardButton("⚖️ Open Dispute", callback_data=f"dispute_{trade_id}")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        f"⏳ *Payment Under Review for Trade #{trade_id}*\n\n"
+        f"TX Hash: `{tx_hash}`\n\n"
+        "Seller should now deliver the product. Once received, click *Confirm Delivery*.",
+        parse_mode="Markdown",
+        reply_markup=reply_markup
+    )
+    context.user_data.pop('paying_trade_id', None)
+    return ConversationHandler.END
 
-    result = await verify_transaction(tx_hash, trade["total_required"])
+async def cancel_pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop('paying_trade_id', None)
+    await update.message.reply_text("Payment submission cancelled.")
+    return ConversationHandler.END
 
-    if not result["valid"]:
-        await update.message.reply_text(
-            f"❌ <b>Verification Failed</b>\n\n{result['reason']}",
-            parse_mode=ParseMode.HTML,
-        )
-        return
+# ─── ADMIN COMMANDS ───────────────────────────────────────────────────────────
 
-    # Mark TX as used and update trade
-    db.mark_tx_used(tx_hash, trade_id)
-    db.update_trade_status(trade_id, "PAYMENT_VERIFIED", tx_hash=tx_hash)
+async def cmd_release(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID: return
+    try:
+        trade_id = int(context.args[0])
+        db.update_trade_status(trade_id, "Completed")
+        await update.message.reply_text(f"✅ Trade #{trade_id} manually marked as Completed (Released).")
+    except:
+        await update.message.reply_text("Format: `/release <trade_id>`")
 
+async def cmd_refund(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID: return
+    try:
+        trade_id = int(context.args[0])
+        db.update_trade_status(trade_id, "Refunded")
+        await update.message.reply_text(f"🔙 Trade #{trade_id} marked as Refunded.")
+    except:
+        await update.message.reply_text("Format: `/refund <trade_id>`")
+
+async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID: return
+    try:
+        user_id = int(context.args[0])
+        db.ban_user(user_id)
+        await update.message.reply_text(f"🔨 User {user_id} has been banned globally.")
+    except:
+        await update.message.reply_text("Format: `/ban <user_id>`")
+
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    comp, vol, act = db.get_stats()
     text = (
-        f"✅ <b>Payment Verified!</b>\n\n"
-        f"🆔 Trade ID : <code>{trade_id}</code>\n"
-        f"💰 Amount   : {fmt_usdt(result['amount'])}\n"
-        f"🔗 TX Hash  : <code>{tx_hash}</code>\n\n"
-        f"The seller <b>@{trade['seller_username']}</b> must now confirm delivery.\n"
-        f"Seller runs: <code>/confirm {trade_id}</code>\n\n"
-        "If there's a problem, either party can run:\n"
-        f"<code>/dispute {trade_id} your reason here</code>"
+        "👑 *Admin Dashboard*\n\n"
+        f"✅ Completed Trades: {comp}\n"
+        f"💰 Total Volume: {vol:,.2f} USDT\n"
+        f"🔄 Active Trades: {act}\n"
     )
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
-
-    # Notify admin
-    try:
-        await context.bot.send_message(
-            ADMIN_ID,
-            f"🔔 <b>Payment Verified</b>\n\n"
-            f"Trade: <code>{trade_id}</code>\n"
-            f"Buyer: @{user.username or user.id}\n"
-            f"Seller: @{trade['seller_username']}\n"
-            f"Amount: {fmt_usdt(result['amount'])}\n"
-            f"TX: <code>{tx_hash}</code>",
-            parse_mode=ParseMode.HTML,
-        )
-    except Exception:
-        pass  # Admin notification is non-critical
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# /status <trade_id>
-# ──────────────────────────────────────────────────────────────────────────────
-
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    args = context.args
-    if not args:
-        await update.message.reply_text("❌ Usage: /status <trade_id>")
-        return
-
-    trade_id = args[0].upper().strip()
-    trade = db.get_trade(trade_id)
-    if not trade:
-        await update.message.reply_text(f"❌ Trade <code>{trade_id}</code> not found.", parse_mode=ParseMode.HTML)
-        return
-
-    await update.message.reply_text(trade_summary(trade), parse_mode=ParseMode.HTML)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# /confirm <trade_id>   (seller confirms delivery)
-# ──────────────────────────────────────────────────────────────────────────────
-
-async def cmd_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    args = context.args
-
-    if not args:
-        await update.message.reply_text("❌ Usage: /confirm <trade_id>")
-        return
-
-    trade_id = args[0].upper().strip()
-    trade = db.get_trade(trade_id)
-    if not trade:
-        await update.message.reply_text(f"❌ Trade <code>{trade_id}</code> not found.", parse_mode=ParseMode.HTML)
-        return
-
-    # Only the seller (matched by username) can confirm
-    seller_uname = (user.username or "").lower()
-    if seller_uname != trade["seller_username"].lower():
-        await update.message.reply_text("❌ Only the seller of this trade can confirm delivery.")
-        return
-
-    if trade["status"] != "PAYMENT_VERIFIED":
-        await update.message.reply_text(
-            f"❌ Cannot confirm — trade status is <b>{trade['status']}</b>.",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
-    db.update_trade_status(trade_id, "COMPLETED", seller_id=user.id)
-
-    text = (
-        f"🎉 <b>Trade Completed!</b>\n\n"
-        f"🆔 Trade ID : <code>{trade_id}</code>\n"
-        f"✅ Seller @{trade['seller_username']} has confirmed delivery.\n"
-        f"💰 {fmt_usdt(trade['amount_usdt'])} released to seller.\n\n"
-        "Thank you for using our escrow service!"
-    )
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
-
-    # Notify admin
-    try:
-        await context.bot.send_message(
-            ADMIN_ID,
-            f"✅ <b>Trade Completed</b>\n\nTrade: <code>{trade_id}</code>\nSeller: @{user.username}",
-            parse_mode=ParseMode.HTML,
-        )
-    except Exception:
-        pass
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# /dispute <trade_id> <reason…>
-# ──────────────────────────────────────────────────────────────────────────────
-
-async def cmd_dispute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    args = context.args
-
-    if len(args) < 2:
-        await update.message.reply_text(
-            "❌ Usage: /dispute <trade_id> <reason>\n"
-            "Example: /dispute ESC-A3F9B2 Seller did not deliver the item"
-        )
-        return
-
-    trade_id = args[0].upper().strip()
-    reason = " ".join(args[1:]).strip()
-
-    trade = db.get_trade(trade_id)
-    if not trade:
-        await update.message.reply_text(f"❌ Trade <code>{trade_id}</code> not found.", parse_mode=ParseMode.HTML)
-        return
-
-    # Must be buyer or seller
-    buyer_match = trade["buyer_id"] == user.id
-    seller_match = (user.username or "").lower() == trade["seller_username"].lower()
-    if not buyer_match and not seller_match:
-        await update.message.reply_text("❌ You are not a party to this trade.")
-        return
-
-    if trade["status"] in ("COMPLETED", "CANCELLED"):
-        await update.message.reply_text(
-            f"❌ Cannot dispute a trade with status <b>{trade['status']}</b>.",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
-    db.update_trade_status(trade_id, "DISPUTED", dispute_reason=reason)
-
-    await update.message.reply_text(
-        f"⚠️ <b>Dispute Raised</b>\n\n"
-        f"🆔 Trade ID : <code>{trade_id}</code>\n"
-        f"📝 Reason   : {reason}\n\n"
-        "An admin will review and contact both parties.",
-        parse_mode=ParseMode.HTML,
-    )
-
-    # Notify admin
-    try:
-        role = "Buyer" if buyer_match else "Seller"
-        await context.bot.send_message(
-            ADMIN_ID,
-            f"🚨 <b>DISPUTE RAISED</b>\n\n"
-            f"Trade: <code>{trade_id}</code>\n"
-            f"{role}: @{user.username or user.id}\n"
-            f"Reason: {reason}\n\n"
-            f"Review with /admin_trade {trade_id}",
-            parse_mode=ParseMode.HTML,
-        )
-    except Exception:
-        pass
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# /cancel <trade_id>
-# ──────────────────────────────────────────────────────────────────────────────
-
-async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    args = context.args
-
-    if not args:
-        await update.message.reply_text("❌ Usage: /cancel <trade_id>")
-        return
-
-    trade_id = args[0].upper().strip()
-    trade = db.get_trade(trade_id)
-    if not trade:
-        await update.message.reply_text(f"❌ Trade <code>{trade_id}</code> not found.", parse_mode=ParseMode.HTML)
-        return
-
-    if trade["buyer_id"] != user.id:
-        await update.message.reply_text("❌ Only the buyer can cancel this trade.")
-        return
-
-    if trade["status"] != "AWAITING_PAYMENT":
-        await update.message.reply_text(
-            f"❌ Cannot cancel a trade with status <b>{trade['status']}</b>. "
-            "Raise a /dispute instead.",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
-    db.update_trade_status(trade_id, "CANCELLED")
-    await update.message.reply_text(
-        f"🚫 Trade <code>{trade_id}</code> has been <b>cancelled</b>.",
-        parse_mode=ParseMode.HTML,
-    )
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Admin: /admin_trades   — list recent trades
-# ──────────────────────────────────────────────────────────────────────────────
-
-async def cmd_admin_trades(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    if user.id != ADMIN_ID:
-        await update.message.reply_text("⛔ Admin only.")
-        return
-
-    trades = db.get_all_trades(limit=30)
-    if not trades:
-        await update.message.reply_text("No trades yet.")
-        return
-
-    lines = ["<b>📋 Last 30 Trades</b>\n"]
-    for t in trades:
-        status_icon = {
-            "AWAITING_PAYMENT": "⏳",
-            "PAYMENT_VERIFIED": "💳",
-            "COMPLETED": "✅",
-            "DISPUTED": "🚨",
-            "CANCELLED": "🚫",
-        }.get(t["status"], "❓")
-
-        lines.append(
-            f"{status_icon} <code>{t['trade_id']}</code> | "
-            f"{fmt_usdt(t['total_required'])} | "
-            f"@{t['seller_username']} | "
-            f"{t['status']}"
-        )
-
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Admin: /admin_trade <trade_id>   — full detail
-# ──────────────────────────────────────────────────────────────────────────────
-
-async def cmd_admin_trade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    if user.id != ADMIN_ID:
-        await update.message.reply_text("⛔ Admin only.")
-        return
-
-    args = context.args
-    if not args:
-        await update.message.reply_text("❌ Usage: /admin_trade <trade_id>")
-        return
-
-    trade_id = args[0].upper().strip()
-    trade = db.get_trade(trade_id)
-    if not trade:
-        await update.message.reply_text(f"❌ Trade {trade_id} not found.")
-        return
-
-    await update.message.reply_text(trade_summary(trade), parse_mode=ParseMode.HTML)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Admin: /admin_resolve <trade_id> <buyer|seller>
-# ──────────────────────────────────────────────────────────────────────────────
-
-async def cmd_admin_resolve(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    if user.id != ADMIN_ID:
-        await update.message.reply_text("⛔ Admin only.")
-        return
-
-    args = context.args
-    if len(args) < 2:
-        await update.message.reply_text("❌ Usage: /admin_resolve <trade_id> <buyer|seller>")
-        return
-
-    trade_id = args[0].upper().strip()
-    resolution = args[1].lower().strip()
-
-    if resolution not in ("buyer", "seller"):
-        await update.message.reply_text("❌ Resolution must be 'buyer' or 'seller'.")
-        return
-
-    trade = db.get_trade(trade_id)
-    if not trade:
-        await update.message.reply_text(f"❌ Trade {trade_id} not found.")
-        return
-
-    if trade["status"] != "DISPUTED":
-        await update.message.reply_text("❌ Trade is not in DISPUTED status.")
-        return
-
-    new_status = "COMPLETED" if resolution == "seller" else "CANCELLED"
-    db.update_trade_status(trade_id, new_status)
-
-    await update.message.reply_text(
-        f"✅ Trade <code>{trade_id}</code> resolved in favour of <b>{resolution}</b>. "
-        f"New status: <b>{new_status}</b>",
-        parse_mode=ParseMode.HTML,
-    )
+    await update.message.reply_text(text, parse_mode="Markdown")
+    
