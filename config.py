@@ -1,26 +1,14 @@
 import os
-from dotenv import load_dotenv
 
-load_dotenv()
+# Telegram Bot Token (Daga BotFather)
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8411776619:AAE3QN4M0nnSdDdms-xkUoS_syIQENjcca0")
 
-# ── Telegram ──────────────────────────────────────────────────────────────────
-BOT_TOKEN: str = os.environ["BOT_TOKEN"]
-ADMIN_ID: int = int(os.environ["ADMIN_ID"])
+# Admin ID (Dole ya zama LAMBA, ba username ba)
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "5027660887"))
 
-# ── BSC / BscScan ─────────────────────────────────────────────────────────────
-BSC_ADDRESS: str = os.environ["BSC_ADDRESS"].lower()          # escrow wallet (lowercase)
-BSC_API_KEY: str = os.environ["BSC_API_KEY"]
+# Escrow Wallet Address
+ESCROW_WALLET = "0x9e3e0ab7a0f1a6c5acd99361009d167bb072af44"
 
-# USDT BEP-20 contract on BSC mainnet (official, checksummed)
-USDT_CONTRACT: str = "0x55d398326f99059ff775485246999027b3197955"
-
-BSCSCAN_API_URL: str = "https://api.bscscan.com/api"
-
-# ── Commission ────────────────────────────────────────────────────────────────
-COMMISSION_PERCENT: float = float(os.getenv("COMMISSION_PERCENT", "5"))
-
-# ── Misc ──────────────────────────────────────────────────────────────────────
-DATABASE_PATH: str = os.getenv("DATABASE_PATH", "escrow.db")
-
-# BEP-20 USDT has 18 decimals
-USDT_DECIMALS: int = 18
+# Fee & Support
+FEE_PERCENTAGE = 0.05  # 5%
+SUPPORT_CONTACT = "@ChDev0" # Gross support
