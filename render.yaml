@@ -1,0 +1,24 @@
+services:
+  - type: worker
+    name: escrow-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: BSC_ADDRESS
+        sync: false
+      - key: BSC_API_KEY
+        sync: false
+      - key: ADMIN_ID
+        sync: false
+      - key: COMMISSION_PERCENT
+        value: "5"
+      - key: DATABASE_PATH
+        value: /data/escrow.db
+    disk:
+      name: escrow-data
+      mountPath: /data
+      sizeGB: 1
